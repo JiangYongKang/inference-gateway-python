@@ -1,0 +1,20 @@
+{
+  "aliases": {
+    "chat": {
+      "versions": [
+        {"version": "v1.0", "backends": ["local-a", "local-b"], "weight": 800},
+        {"version": "v2.0", "backends": ["local-c"], "weight": 200}
+      ],
+      "groups": [
+        {"group": "beta-testers", "version": "v2.0"},
+        {"group": "pinned-legacy", "version": "v1.0"}
+      ],
+      "stable_version": "v1.0"
+    }
+  },
+  "quotas": {
+    "team-alpha": {"limit": 4, "window_seconds": 60},
+    "team-beta":  {"limit": 2, "window_seconds": 60}
+  },
+  "limits": {"max_concurrency": 2, "max_queue": 2}
+}
