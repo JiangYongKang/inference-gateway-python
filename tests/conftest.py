@@ -7,6 +7,7 @@ from gateway.concurrency import ConcurrencyLimiter
 from gateway.gateway import InferenceGateway
 from gateway.quotas import QuotaLimiter
 from gateway.registry import ModelRegistry
+from gateway.retention import RetentionConfig, RetentionStore
 
 
 class ManualClock:
@@ -40,6 +41,7 @@ def make_gateway(clock, caplog):
         default_limit=None,
         max_concurrent=4,
         max_queue=4,
+        retention=None,
     ):
         registry = ModelRegistry()
         for alias, version, backend_names, weight in versions or []:
@@ -48,11 +50,16 @@ def make_gateway(clock, caplog):
             registry.set_caller_group(alias, caller, version)
         quota = QuotaLimiter(limits or {}, default_limit=default_limit,
                              window_seconds=60.0, clock=clock)
+        store = None
+        if retention is not None:
+            store = RetentionStore(
+                RetentionConfig(**retention), clock=clock)
         gw = InferenceGateway(
             registry,
             backends or {},
             quota,
             ConcurrencyLimiter(max_concurrent=max_concurrent, max_queue=max_queue),
+            store,
         )
         return gw
 

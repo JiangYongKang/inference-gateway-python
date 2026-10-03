@@ -73,3 +73,77 @@ def test_stats_endpoint(client):
     client.post("/v1/infer", json={"model": "m", "prompt": "s", "caller_id": "c9"})
     r = client.get("/v1/stats")
     assert r.status_code == 200 and r.json()["success"] == 1
+
+
+@pytest.fixture
+def retention_client(make_gateway):
+    gw = make_gateway(
+        versions=[("m", "v1", ["b"], 1)],
+        backends={"b": DeterministicBackend("b")},
+        retention=dict(
+            idempotency_ttl_seconds=300.0,
+            idempotency_max_entries_per_caller=2,
+            reuse_ttl_seconds=60.0,
+            reuse_max_entries_per_caller=10,
+        ),
+    )
+    c = TestClient(create_app(gw))
+    c.gateway = gw
+    return c
+
+
+def test_replay_and_reuse_flags_over_http(retention_client):
+    r1 = retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "p", "caller_id": "c1", "request_id": "rid-1"}).json()
+    r2 = retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "p", "caller_id": "c1", "request_id": "rid-1"}).json()
+    r3 = retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "p", "caller_id": "c1", "request_id": "rid-2"}).json()
+    log.info("input=replay+reuse judgement r2.replayed=%s r3.reused=%s",
+             r2["replayed"], r3["reused"])
+    assert r1["replayed"] is False and r1["reused"] is False
+    assert r2["replayed"] is True and r2["output"] == r1["output"]
+    assert r3["reused"] is True and r3["replayed"] is False
+    # 旧字段名字与含义不变
+    assert set(r2) >= {"request_id", "model", "version", "backend", "output",
+                       "cached", "attempts", "fallback_from"}
+
+
+def test_conflict_409_distinct(retention_client):
+    retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "p1", "caller_id": "c1", "request_id": "rid-1"})
+    r = retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "p2", "caller_id": "c1", "request_id": "rid-1"})
+    log.info("input=conflict judgement=%s", r.json())
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "idempotency_conflict"
+
+
+def test_store_full_429_distinct(retention_client):
+    for i in range(2):
+        retention_client.post("/v1/infer", json={
+            "model": "m", "prompt": f"p{i}", "caller_id": "c1", "request_id": f"rid-{i}"})
+    r = retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "px", "caller_id": "c1", "request_id": "rid-x"})
+    log.info("input=store-full judgement=%s", r.json())
+    assert r.status_code == 429
+    assert r.json()["error"]["code"] == "idempotency_store_full"
+
+
+def test_stats_expose_retention(retention_client):
+    retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "p", "caller_id": "c1", "request_id": "rid-1"})
+    retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "p", "caller_id": "c1", "request_id": "rid-1"})
+    body = retention_client.get("/v1/stats").json()
+    log.info("input=stats judgement=%s", body["retention"])
+    assert body["success"] == 1
+    assert body["retention"]["counters"]["replay_hits"] == 1
+    assert body["retention"]["records"]["idempotency"] == {"c1": 1}
+
+
+def test_admin_purge_endpoint(retention_client):
+    retention_client.post("/v1/infer", json={
+        "model": "m", "prompt": "p", "caller_id": "c1"})
+    r = retention_client.post("/v1/admin/reuse/purge", params={"model": "m", "version": "v1"})
+    assert r.status_code == 200 and r.json()["removed"] == 1

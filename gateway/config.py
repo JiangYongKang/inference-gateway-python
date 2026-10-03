@@ -7,6 +7,7 @@ from .concurrency import ConcurrencyLimiter
 from .gateway import InferenceGateway
 from .quotas import QuotaLimiter
 from .registry import ModelRegistry
+from .retention import RetentionConfig, RetentionStore
 
 
 def build_default_gateway() -> InferenceGateway:
@@ -23,4 +24,10 @@ def build_default_gateway() -> InferenceGateway:
     }
     quota = QuotaLimiter({"internal": 1000}, default_limit=100, window_seconds=60.0)
     concurrency = ConcurrencyLimiter(max_concurrent=16, max_queue=64)
-    return InferenceGateway(registry, backends, quota, concurrency)
+    retention = RetentionStore(RetentionConfig(
+        idempotency_ttl_seconds=300.0,
+        idempotency_max_entries_per_caller=1000,
+        reuse_ttl_seconds=60.0,
+        reuse_max_entries_per_caller=1000,
+    ))
+    return InferenceGateway(registry, backends, quota, concurrency, retention)

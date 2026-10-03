@@ -22,6 +22,8 @@ class InferResponse(BaseModel):
     cached: bool = False
     attempts: int = 1
     fallback_from: list[str] = Field(default_factory=list)
+    replayed: bool = Field(default=False, description="历史结论重放：同调用标识的首次成功结论")
+    reused: bool = Field(default=False, description="结果复用：本次未重新执行后端")
 
 
 class ErrorBody(BaseModel):

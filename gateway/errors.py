@@ -58,3 +58,24 @@ class BackendExecutionError(GatewayError):
 class AllBackendsFailedError(GatewayError):
     code = "all_backends_failed"
     http_status = 502
+
+
+class IdempotencyConflictError(GatewayError):
+    """同一调用标识被复用于不同模型或不同请求内容。"""
+
+    code = "idempotency_conflict"
+    http_status = 409
+
+
+class IdempotencyStoreFullError(GatewayError):
+    """调用标识记录已达容量上限且均在保留期内，快速拒绝新请求。"""
+
+    code = "idempotency_store_full"
+    http_status = 429
+
+
+class InvalidRetentionConfigError(GatewayError):
+    """保留/容量配置非法，加载阶段直接拒绝。"""
+
+    code = "invalid_retention_config"
+    http_status = 500
