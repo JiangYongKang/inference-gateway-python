@@ -22,6 +22,10 @@ class InferResponse(BaseModel):
     cached: bool = False
     attempts: int = 1
     fallback_from: list[str] = Field(default_factory=list)
+    # 以下为治理新增字段（只新增，旧客户端可忽略）：
+    replayed: bool = False       # True = 命中同一调用标识的历史结论，未重新执行后端
+    reuse_hit: bool = False      # True = 命中跨请求复用结论，未重新执行后端
+    reused_from: str | None = None  # 复用来源结论的 request_id（无则为 None）
 
 
 class ErrorBody(BaseModel):

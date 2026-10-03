@@ -5,6 +5,7 @@ from __future__ import annotations
 from .backends import DeterministicBackend
 from .concurrency import ConcurrencyLimiter
 from .gateway import InferenceGateway
+from .governance import GovernanceConfig
 from .quotas import QuotaLimiter
 from .registry import ModelRegistry
 
@@ -23,4 +24,11 @@ def build_default_gateway() -> InferenceGateway:
     }
     quota = QuotaLimiter({"internal": 1000}, default_limit=100, window_seconds=60.0)
     concurrency = ConcurrencyLimiter(max_concurrent=16, max_queue=64)
-    return InferenceGateway(registry, backends, quota, concurrency)
+    # 治理：重放与复用均保留 5 分钟，按调用方隔离容量
+    governance = GovernanceConfig(
+        replay_ttl_seconds=300.0,
+        replay_max_per_caller=128,
+        reuse_ttl_seconds=300.0,
+        reuse_max_per_caller=256,
+    )
+    return InferenceGateway(registry, backends, quota, concurrency, governance)

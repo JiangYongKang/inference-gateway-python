@@ -58,3 +58,24 @@ class BackendExecutionError(GatewayError):
 class AllBackendsFailedError(GatewayError):
     code = "all_backends_failed"
     http_status = 502
+
+
+class IdempotencyConflictError(GatewayError):
+    """同一调用方的同一调用标识绑定了不同模型或不同请求内容。"""
+
+    code = "idempotency_conflict"
+    http_status = 409
+
+
+class RecordCapacityError(GatewayError):
+    """该调用方的治理记录区已满，且无过期项可清，新请求被快速拒绝。"""
+
+    code = "record_capacity_exceeded"
+    http_status = 507
+
+
+class InvalidGovernanceConfigError(GatewayError):
+    """重放/复用治理配置非法（保留期、容量等越界），加载阶段直接拒绝。"""
+
+    code = "invalid_governance_config"
+    http_status = 500

@@ -5,6 +5,7 @@ import pytest
 from gateway.backends import DeterministicBackend
 from gateway.concurrency import ConcurrencyLimiter
 from gateway.gateway import InferenceGateway
+from gateway.governance import GovernanceConfig
 from gateway.quotas import QuotaLimiter
 from gateway.registry import ModelRegistry
 
@@ -40,6 +41,8 @@ def make_gateway(clock, caplog):
         default_limit=None,
         max_concurrent=4,
         max_queue=4,
+        governance=None,
+        governance_enabled=True,
     ):
         registry = ModelRegistry()
         for alias, version, backend_names, weight in versions or []:
@@ -48,11 +51,15 @@ def make_gateway(clock, caplog):
             registry.set_caller_group(alias, caller, version)
         quota = QuotaLimiter(limits or {}, default_limit=default_limit,
                              window_seconds=60.0, clock=clock)
+        if governance is None and governance_enabled:
+            governance = GovernanceConfig()
         gw = InferenceGateway(
             registry,
             backends or {},
             quota,
             ConcurrencyLimiter(max_concurrent=max_concurrent, max_queue=max_queue),
+            governance,
+            clock=clock,
         )
         return gw
 
