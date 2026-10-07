@@ -9,7 +9,9 @@
 
 重放/复用语义（见 retention.py）：
 - 同调用方同 request_id 首次成功后，保留期内重放返回同一份结论并标记 replayed。
-- 并发同标识只真正执行一次；首次失败不占标识，重试按当时路由重新执行。
+- 并发同标识只真正执行一次：成功结论由整批共享；leader 失败时整批共享同一份
+  失败（不各自重新执行、不重复扣配额），失败不占标识，之后的新请求按当时路由
+  重新执行。只有成功才形成保留期内的一致结论。
 - 复用只在同调用方、同模型、同实际版本、同内容之间生效；版本变化自然未命中。
 """
 
@@ -93,14 +95,24 @@ class InferenceGateway:
                         request.caller_id, request.request_id, conclusion.version,
                     )
                     return self._replay_response(request, conclusion)
-                continue  # leader 失败：标识已释放，按当时路由重新认领执行
+                failure = claim.record.failure
+                if failure is not None:
+                    # 同批并发共享 leader 的同一份失败：不重新执行、不重复扣配额，
+                    # 整批结论一致（要么同一份成功，要么同一份失败）。
+                    log.info(
+                        "shared failure (concurrent leader) caller=%s request_id=%s code=%s",
+                        request.caller_id, request.request_id,
+                        getattr(failure, "code", type(failure).__name__),
+                    )
+                    raise failure
+                continue  # leader 被取消：标识已释放，按当时路由重新认领执行
 
             # claimed：本次由自己真正执行
             rec = claim.record
             try:
                 response = await self._execute(request)
-            except BaseException:
-                store.abort(request.caller_id, request.request_id, rec)
+            except BaseException as e:
+                store.abort(request.caller_id, request.request_id, rec, e)
                 raise
             store.complete(
                 request.caller_id, request.request_id, rec,

@@ -8,7 +8,8 @@
   过期按未命中处理；容量满时按确定顺序（最久未使用，键名字典序兜底）淘汰。
 
 并发同标识：首个到达者成为 leader 真正执行，其余等待其结论；
-leader 失败则释放标识，等待者重试时可按当时路由重新执行。
+leader 失败则同批等待者共享这同一份失败（不各自重新执行），标识随即释放，
+之后再拿同一标识来的新请求按当时路由重新执行。只有成功才形成保留期内的承诺。
 """
 
 from __future__ import annotations
@@ -82,6 +83,7 @@ class _IdemRecord:
     fingerprint: tuple[str, str]  # (model, prompt) —— 同标识不同内容按冲突拒绝
     created_at: float
     conclusion: Conclusion | None = None  # None 表示在途
+    failure: BaseException | None = None  # leader 的失败结论：同批等待者共享，不占标识
     done: asyncio.Event | None = None     # 在途完成信号（成功或失败都置位）
 
 
@@ -157,7 +159,12 @@ class RetentionStore:
         return Claim("claimed", record=rec)
 
     async def wait_for(self, rec: _IdemRecord) -> Conclusion | None:
-        """等待在途记录完成；返回结论（计一次重放命中）或 None（leader 失败）。"""
+        """等待在途记录完成；返回结论（计一次重放命中）或 None。
+
+        返回 None 时调用方需检查 rec.failure：非 None 表示 leader 失败，
+        同批等待者应共享这同一份失败而不是重新执行；None 表示 leader 被取消，
+        标识已释放，可重新认领执行。
+        """
         assert rec.done is not None
         await rec.done.wait()
         if rec.conclusion is not None:
@@ -170,8 +177,16 @@ class RetentionStore:
         if rec.done is not None:
             rec.done.set()
 
-    def abort(self, caller: str, request_id: str, rec: _IdemRecord) -> None:
-        """leader 失败/取消：释放标识（不占位），唤醒等待者去重试。"""
+    def abort(self, caller: str, request_id: str, rec: _IdemRecord,
+              exc: BaseException | None = None) -> None:
+        """leader 失败/取消：释放标识（不占位），唤醒等待者。
+
+        失败（非取消）时把异常留在记录上，已挂上等待的同批请求共享这同一份
+        失败结论，不会各自重新执行；标识本身已删除，之后的新请求可重新认领。
+        取消不视为可对客户端承诺的结论，不记录，等待者按重新认领处理。
+        """
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            rec.failure = exc
         records = self._idem.get(caller)
         if records is not None and records.get(request_id) is rec:
             del records[request_id]
