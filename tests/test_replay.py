@@ -8,6 +8,7 @@ import pytest
 from gateway.backends import DeterministicBackend
 from gateway.errors import (
     AllBackendsFailedError,
+    BackendExecutionError,
     IdempotencyConflictError,
     IdempotencyStoreFullError,
     InvalidRetentionConfigError,
@@ -36,6 +37,185 @@ def mk(make_gateway, backends=None, **kw):
         retention=RET,
         **kw,
     )
+
+
+class BlockingBackend:
+    """确定性阻塞后端：调用进入后在 gate 上等待，直到测试决定放行或注入故障。
+
+    用于稳定复现"一批并发同标识同时在途"的竞态：先确认所有请求都已进入后端，
+    再让这次真实执行失败，避免依赖 sleep 时序。
+    """
+
+    def __init__(self, name: str, *, fail: bool = False) -> None:
+        self.name = name
+        self.calls = 0
+        self._fail = fail
+        self._entered = asyncio.Event()
+        self._gate = asyncio.Event()
+
+    async def wait_entered(self) -> None:
+        await self._entered.wait()
+
+    def release_ok(self) -> None:
+        self._fail = False
+        self._gate.set()
+
+    def release_fail(self) -> None:
+        self._fail = True
+        self._gate.set()
+
+    async def infer(self, prompt: str, *, version: str, timeout_ms: int | None) -> str:
+        self.calls += 1
+        self._entered.set()
+        await self._gate.wait()
+        if self._fail:
+            raise BackendExecutionError(
+                f"backend {self.name} injected execution error",
+                detail={"backend": self.name},
+            )
+        return f"{self.name}:{version}:blocking-ok:{prompt}"
+
+
+def _codes(outcomes) -> list[str | None]:
+    return [getattr(o, "code", None) if isinstance(o, BaseException) else None for o in outcomes]
+
+
+def _ok_count(outcomes) -> int:
+    return sum(1 for o in outcomes if not isinstance(o, BaseException))
+
+
+async def test_concurrent_same_id_single_backend_failure_shared(make_gateway):
+    """后端固定报错：一批并发同标识只真正执行一次，全批拿到同一个失败，只扣一次额度。"""
+    backend = DeterministicBackend("b", latency_ms=30, fault_plan=["error"])
+    gw = mk(make_gateway, backends={"b": backend}, limits={"c1": 100})
+    outcomes = await asyncio.gather(
+        *[gw.infer(req("r1")) for _ in range(6)], return_exceptions=True)
+    log.info(
+        "input=6-concurrent-same-id-all-error basis=idempotency-single-lead "
+        "judgement codes=%s backend_calls=%d quota=%d stats(success=%d failed=%d rejected=%d)",
+        _codes(outcomes), backend.calls, gw._quota.usage("c1"),
+        gw.stats.success, gw.stats.failed, gw.stats.rejected,
+    )
+    assert backend.calls == 1                          # 整批只真正执行一次
+    assert _codes(outcomes) == ["all_backends_failed"] * 6  # 结论不分叉
+    assert gw._quota.usage("c1") == 1                 # 只扣一次额度
+    assert gw.stats.failed == 1 and gw.stats.success == 0
+    assert gw.stats.rejected == 0
+    assert gw._retention.stats.replay_hits == 0       # 失败共享不计重放命中
+
+    # 失败不占标识：之后拿同一标识重试，按当时路由重新执行并成功
+    retry = await gw.infer(req("r1"))
+    log.info("input=retry-after-concurrent-failure basis=id-released judgement=%s",
+             retry.model_dump())
+    assert not retry.replayed and retry.output
+    assert backend.calls == 2
+    assert gw.stats.success == 1
+
+
+async def test_concurrent_same_id_failure_then_success_mixed(make_gateway):
+    """报错与成功混合：同标识首批并发全失败（一次执行）；标识释放后下一批并发全成功，
+    两批之间不出现一部分失败、一部分成功的分叉。"""
+    backend = DeterministicBackend("b", latency_ms=30, fault_plan=["error"])
+    gw = mk(make_gateway, backends={"b": backend}, limits={"c1": 100})
+
+    batch_fail = await asyncio.gather(
+        *[gw.infer(req("r1")) for _ in range(4)], return_exceptions=True)
+    assert _codes(batch_fail) == ["all_backends_failed"] * 4
+    assert backend.calls == 1 and gw.stats.failed == 1
+
+    # fault_plan 已耗尽，之后调用成功；第二批并发同标识只执行一次，其余重放
+    batch_ok = await asyncio.gather(
+        *[gw.infer(req("r1")) for _ in range(4)], return_exceptions=True)
+    log.info(
+        "input=fail-batch-then-success-batch basis=release-and-reclaim "
+        "judgement fail_codes=%s ok=%d replayed=%d backend_calls=%d quota=%d "
+        "stats(success=%d failed=%d)",
+        _codes(batch_fail), _ok_count(batch_ok),
+        sum(getattr(o, "replayed", False) for o in batch_ok if not isinstance(o, BaseException)),
+        backend.calls, gw._quota.usage("c1"), gw.stats.success, gw.stats.failed,
+    )
+    assert _ok_count(batch_ok) == 4                   # 无分叉：4 个全部成功
+    assert all(not isinstance(o, BaseException) and o.output == batch_ok[0].output
+               for o in batch_ok)
+    assert sum(o.replayed for o in batch_ok) == 3
+    assert backend.calls == 2                         # 失败一次 + 成功一次
+    assert gw._quota.usage("c1") == 2                 # 每批真实执行只扣一次
+    assert gw.stats.success == 1 and gw.stats.failed == 1
+    assert gw._retention.stats.replay_hits == 3
+
+
+async def test_concurrent_same_id_failure_blocked_at_backend(make_gateway):
+    """用显式门闩保证 5 个请求都已在途后再让后端失败：整批共享失败、只执行一次。"""
+    backend = BlockingBackend("b", fail=True)
+    gw = mk(make_gateway, backends={"b": backend}, limits={"c1": 100})
+    tasks = [asyncio.ensure_future(gw.infer(req("r1"))) for _ in range(5)]
+    await backend.wait_entered()                      # 唯一一次真实执行已进入后端
+    await asyncio.sleep(0)                            # 让其余 follower 挂到在途记录上
+    backend.release_fail()
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    log.info(
+        "input=5-concurrent-gated-failure basis=single-inflight-lead "
+        "judgement codes=%s backend_calls=%d quota=%d",
+        _codes(outcomes), backend.calls, gw._quota.usage("c1"),
+    )
+    assert backend.calls == 1
+    assert _codes(outcomes) == ["all_backends_failed"] * 5
+    assert gw._quota.usage("c1") == 1 and gw.stats.failed == 1
+
+    # 放行成功后，同标识重试应重新真实执行（失败未占位）
+    backend.release_ok()
+    retry = await gw.infer(req("r1"))
+    assert not retry.replayed and retry.output.endswith("p")
+    assert backend.calls == 2
+
+
+async def test_concurrent_same_id_timeout_failure_shared(make_gateway):
+    """后端超时同样属于终态失败：一批并发同标识只真实执行/超时一次并共享失败。"""
+    backend = DeterministicBackend("b", latency_ms=0, fault_plan=["timeout"])
+    gw = mk(make_gateway, backends={"b": backend}, limits={"c1": 100})
+
+    async def one():
+        return await gw.infer(req("r1", timeout_ms=30))
+
+    outcomes = await asyncio.gather(*[one() for _ in range(4)], return_exceptions=True)
+    codes = _codes(outcomes)
+    log.info("input=4-concurrent-same-id-timeout judgement codes=%s backend_calls=%d quota=%d",
+             codes, backend.calls, gw._quota.usage("c1"))
+    assert codes == ["all_backends_failed"] * 4
+    assert backend.calls == 1
+    assert gw._quota.usage("c1") == 1 and gw.stats.failed == 1
+
+
+async def test_concurrent_same_id_quota_reject_is_shared_and_distinct(make_gateway):
+    """额度不足在并发同标识下也整批一致拒绝（不分叉、只计一次），错误码与后端失败可区分，
+    且不触发任何后端调用。"""
+    backend = DeterministicBackend("b")
+    gw = mk(make_gateway, backends={"b": backend}, limits={"c1": 1})
+    await gw.infer(req("other", prompt="seed"))       # 用掉唯一额度
+    outcomes = await asyncio.gather(
+        *[gw.infer(req("r1")) for _ in range(4)], return_exceptions=True)
+    log.info("input=4-concurrent-same-id-no-quota judgement codes=%s backend_calls=%d",
+             _codes(outcomes), backend.calls)
+    assert _codes(outcomes) == ["quota_exceeded"] * 4
+    assert backend.calls == 1                         # 额度拒绝不调后端
+    assert gw.stats.rejected == 1 and gw.stats.failed == 0
+    assert gw._retention.stats.replay_hits == 0
+
+async def test_concurrent_same_id_failure_does_not_occupy_capacity(make_gateway):
+    """并发失败不写入标识记录：容量上限内，失败批次之后仍能用新标识/同标识成功。"""
+    backend = DeterministicBackend("b", latency_ms=20, fault_plan=["error"])
+    gw = mk(make_gateway, backends={"b": backend})    # 容量=3（见 RET）
+    outcomes = await asyncio.gather(
+        *[gw.infer(req("r1")) for _ in range(3)], return_exceptions=True)
+    assert all(isinstance(o, AllBackendsFailedError) for o in outcomes)
+    assert gw.retention_stats()["records"]["idempotency"] == {}
+    # 容量仍是满的可用空间：连续 3 个新标识成功且不触发 store_full
+    for i in range(RET["idempotency_max_entries_per_caller"]):
+        r = await gw.infer(req(f"ok-{i}"))
+        assert not r.replayed
+    log.info("input=fail-then-fill-capacity judgement calls=%d records=%s",
+             backend.calls, gw.retention_stats()["records"])
+    assert gw._retention.stats.store_full_rejected == 0
 
 
 async def test_concurrent_same_id_executes_once(make_gateway):

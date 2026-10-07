@@ -7,8 +7,11 @@
 - 复用记录（reuse）：(caller, model, version, prompt) -> 已成功的结论。
   过期按未命中处理；容量满时按确定顺序（最久未使用，键名字典序兜底）淘汰。
 
-并发同标识：首个到达者成为 leader 真正执行，其余等待其结论；
-leader 失败则释放标识，等待者重试时可按当时路由重新执行。
+并发同标识：首个到达者成为 leader 真正执行，其余等待其结论。
+- leader 成功：等待者共享同一份成功结论（计重放命中）。
+- leader 终态失败（后端失败/准入拒绝等）：等待者共享同一个失败结果，
+  全批只执行一次、不分叉；标识随即释放，之后的新请求按当时路由重新执行。
+- leader 被取消：标识释放，等待者重新认领执行（取消不形成任何结论）。
 """
 
 from __future__ import annotations
@@ -81,7 +84,8 @@ class RetentionStats:
 class _IdemRecord:
     fingerprint: tuple[str, str]  # (model, prompt) —— 同标识不同内容按冲突拒绝
     created_at: float
-    conclusion: Conclusion | None = None  # None 表示在途
+    conclusion: Conclusion | None = None  # None 表示在途；成功后写入
+    error: BaseException | None = None    # 终态失败（后端失败/准入拒绝等）；取消不设置
     done: asyncio.Event | None = None     # 在途完成信号（成功或失败都置位）
 
 
@@ -156,13 +160,20 @@ class RetentionStore:
         records[request_id] = rec
         return Claim("claimed", record=rec)
 
-    async def wait_for(self, rec: _IdemRecord) -> Conclusion | None:
-        """等待在途记录完成；返回结论（计一次重放命中）或 None（leader 失败）。"""
+    async def wait_for(self, rec: _IdemRecord) -> tuple[Conclusion | None, BaseException | None]:
+        """等待在途记录完成。
+
+        返回 (conclusion, error)，二者互斥：
+        - (结论, None)：leader 成功，共享结论（计一次重放命中）；
+        - (None, 异常)：leader 终态失败，调用方应原样抛出该异常（不计重放）；
+        - (None, None)：leader 被取消、标识已释放，调用方可重新认领执行。
+        """
         assert rec.done is not None
         await rec.done.wait()
         if rec.conclusion is not None:
             self.stats.replay_hits += 1
-        return rec.conclusion
+            return rec.conclusion, None
+        return None, rec.error
 
     def complete(self, caller: str, request_id: str, rec: _IdemRecord, conclusion: Conclusion) -> None:
         """leader 成功：写入结论并唤醒等待者。承诺自此生效，保留期内不可挤掉。"""
@@ -170,8 +181,21 @@ class RetentionStore:
         if rec.done is not None:
             rec.done.set()
 
+    def fail(self, caller: str, request_id: str, rec: _IdemRecord, error: BaseException) -> None:
+        """leader 终态失败：把失败结果交给同批等待者后释放标识。
+
+        先把异常挂到记录上唤醒等待者（保证它们共享同一个失败、不会重新执行），
+        再从存储中删除记录（失败不占标识）：之后到达/重试的请求按当时路由重新执行。
+        """
+        rec.error = error
+        if rec.done is not None:
+            rec.done.set()
+        records = self._idem.get(caller)
+        if records is not None and records.get(request_id) is rec:
+            del records[request_id]
+
     def abort(self, caller: str, request_id: str, rec: _IdemRecord) -> None:
-        """leader 失败/取消：释放标识（不占位），唤醒等待者去重试。"""
+        """leader 被取消：释放标识（不占位、不留结论），唤醒等待者去重新认领执行。"""
         records = self._idem.get(caller)
         if records is not None and records.get(request_id) is rec:
             del records[request_id]

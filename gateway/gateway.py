@@ -9,7 +9,9 @@
 
 重放/复用语义（见 retention.py）：
 - 同调用方同 request_id 首次成功后，保留期内重放返回同一份结论并标记 replayed。
-- 并发同标识只真正执行一次；首次失败不占标识，重试按当时路由重新执行。
+- 并发同标识只真正执行一次：leader 成功则全批共享成功结论；leader 终态失败则全批
+  共享同一个失败（不重复执行、不重复扣配额、结论不分叉），随后释放标识，之后拿同一
+  标识重试按当时路由重新执行；leader 被取消时同批等待者重新认领执行。
 - 复用只在同调用方、同模型、同实际版本、同内容之间生效；版本变化自然未命中。
 """
 
@@ -80,27 +82,55 @@ class InferenceGateway:
             claim = store.begin(request.caller_id, request.request_id, fingerprint)
             if claim.status == "completed":
                 log.info(
-                    "replay hit caller=%s request_id=%s version=%s backend=%s",
-                    request.caller_id, request.request_id,
+                    "replay hit caller=%s request_id=%s model=%s prompt=%r version=%s backend=%s judgement=replay",
+                    request.caller_id, request.request_id, request.model, request.prompt,
                     claim.conclusion.version, claim.conclusion.backend,
                 )
                 return self._replay_response(request, claim.conclusion)
             if claim.status == "in_flight":
-                conclusion = await store.wait_for(claim.record)
+                conclusion, error = await store.wait_for(claim.record)
                 if conclusion is not None:
                     log.info(
-                        "replay hit (concurrent leader) caller=%s request_id=%s version=%s",
-                        request.caller_id, request.request_id, conclusion.version,
+                        "replay hit (concurrent leader) caller=%s request_id=%s model=%s "
+                        "prompt=%r version=%s backend=%s judgement=replay",
+                        request.caller_id, request.request_id, request.model, request.prompt,
+                        conclusion.version, conclusion.backend,
                     )
                     return self._replay_response(request, conclusion)
-                continue  # leader 失败：标识已释放，按当时路由重新认领执行
+                if error is not None:
+                    # leader 终态失败：同批 follower 共享同一个失败，不再执行后端、不重复扣配额
+                    log.info(
+                        "shared leader failure (concurrent) caller=%s request_id=%s model=%s "
+                        "prompt=%r judgement=%s",
+                        request.caller_id, request.request_id, request.model,
+                        request.prompt, getattr(error, "code", type(error).__name__),
+                    )
+                    raise error
+                continue  # leader 被取消：标识已释放，按当时路由重新认领执行
 
             # claimed：本次由自己真正执行
             rec = claim.record
+            # 让出一拍：与本请求同时被调度的同标识 follower 会在这一拍内完成
+            # begin() 注册（asyncio 就绪队列 FIFO，它们先于本任务恢复）。这样即使
+            # 后面的终态是同步抛出的（如额度不足），整批也共享同一个判定，
+            # 不会各自成为 leader 而重复准入、重复计数或结论分叉。
+            await asyncio.sleep(0)
             try:
                 response = await self._execute(request)
-            except BaseException:
+            except asyncio.CancelledError:
+                # 取消不形成结论：释放标识，同批等待者重新认领执行
                 store.abort(request.caller_id, request.request_id, rec)
+                raise
+            except BaseException as exc:
+                # 终态失败（后端失败/准入拒绝等）：整批只执行一次，共享同一个失败结果，
+                # 随后释放标识——之后拿同一标识重试按当时路由重新执行
+                store.fail(request.caller_id, request.request_id, rec, exc)
+                log.info(
+                    "real execution failed (leader) caller=%s request_id=%s model=%s "
+                    "prompt=%r judgement=%s",
+                    request.caller_id, request.request_id, request.model,
+                    request.prompt, getattr(exc, "code", type(exc).__name__),
+                )
                 raise
             store.complete(
                 request.caller_id, request.request_id, rec,
@@ -139,13 +169,14 @@ class InferenceGateway:
     # ---------- 真实执行路径 ----------
 
     async def _execute(self, request: InferRequest) -> InferResponse:
+        completed = False  # 是否已走到终态（含准入/容量拒绝）；仅未完成时退回配额
         try:
             self._quota.acquire(request.caller_id)
         except QuotaExceededError:
             self.stats.rejected += 1
+            completed = True  # 准入拒绝是终态：本就未占用配额，不得误退
             raise
 
-        completed = False
         try:
             decision = self._registry.resolve(request.model, request.caller_id)
 
